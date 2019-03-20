@@ -23,7 +23,7 @@ import (
 
 	"github.com/envoyproxy/go-control-plane/envoy/api/v2/core"
 	"github.com/gogo/protobuf/types"
-	multierror "github.com/hashicorp/go-multierror"
+	"github.com/hashicorp/go-multierror"
 
 	meshconfig "istio.io/api/mesh/v1alpha1"
 )
@@ -32,10 +32,6 @@ import (
 type Environment struct {
 	// Discovery interface for listing services and instances.
 	ServiceDiscovery
-
-	// Accounts interface for listing service accounts
-	// Deprecated - use PushContext.ServiceAccounts
-	ServiceAccounts
 
 	// Config interface for listing routing rules
 	IstioConfigStore
@@ -92,15 +88,24 @@ type Proxy struct {
 
 	// DNSDomain defines the DNS domain suffix for short hostnames (e.g.
 	// "default.svc.cluster.local")
-	DNSDomain string
+	DNSDomains []string
+
+	// TrustDomain defines the trust domain of the certificate
+	TrustDomain string
+
+	//identity that will be the suffix of the spiffe id for SAN verification when connecting to pilot
+	//spiffe://{TrustDomain}/{PilotIdentity}
+	PilotIdentity string
+
+	//identity that will be the suffix of the spiffe id for SAN verification when connecting to mixer
+	//spiffe://{TrustDomain}/{MixerIdentity}
+	//this value would only be used by pilot's proxy to connect to mixer.  All proxies would get mixer SAN pushed through pilot
+	MixerIdentity string
 
 	// ConfigNamespace defines the namespace where this proxy resides
 	// for the purposes of network scoping.
 	// NOTE: DO NOT USE THIS FIELD TO CONSTRUCT DNS NAMES
 	ConfigNamespace string
-
-	// TrustDomain defines the trust domain of the certificate
-	TrustDomain string
 
 	// Metadata key-value pairs extending the Node identifier
 	Metadata map[string]string
@@ -143,7 +148,7 @@ func (node *Proxy) ServiceNode() string {
 		ip = node.IPAddresses[0]
 	}
 	return strings.Join([]string{
-		string(node.Type), ip, node.ID, node.DNSDomain,
+		string(node.Type), ip, node.ID, node.DNSDomains[0],
 	}, serviceNodeSeparator)
 
 }
@@ -288,8 +293,20 @@ func ParseServiceNodeWithMetadata(s string, metadata map[string]string) (*Proxy,
 	}
 
 	out.ID = parts[2]
-	out.DNSDomain = parts[3]
+	out.DNSDomains = getProxyMetadataDNSDomains(out, parts[3])
 	return out, nil
+}
+
+// GetOrDefaultFromMap returns either the value found for key or the default value if the map is nil
+// or does not contain the key. Useful when retrieving node metadata fields.
+func GetOrDefaultFromMap(stringMap map[string]string, key, defaultVal string) string {
+	if stringMap == nil {
+		return defaultVal
+	}
+	if valFromMap, ok := stringMap[key]; ok {
+		return valFromMap
+	}
+	return defaultVal
 }
 
 // GetProxyConfigNamespace extracts the namespace associated with the proxy
@@ -307,12 +324,30 @@ func GetProxyConfigNamespace(proxy *Proxy) string {
 
 	// if not found, for backward compatibility, extract the namespace from
 	// the proxy domain. this is a k8s specific hack and should be enabled
-	parts := strings.Split(proxy.DNSDomain, ".")
+	parts := strings.Split(proxy.DNSDomains[0], ".")
 	if len(parts) > 1 { // k8s will have namespace.<domain>
 		return parts[0]
 	}
 
 	return ""
+}
+
+// getProxyMetadataDNSDomains returns a slice containing every DNS Domain that
+// has been injected into the proxy via the environment variable ISTIO_META_DNS_DOMAINS
+func getProxyMetadataDNSDomains(proxy *Proxy, parts string) []string {
+	if proxy == nil {
+		return nil
+	}
+
+	// If ISTIO_META_DNS_DOMAINS contains a list, produce and return a
+	//  list of unique suffixes
+	if nodeMetadataDNSDomains, found := proxy.Metadata[NodeMetadataDNSDomains]; found {
+		nodeMetadataDNSDomainsUnique := GetUniqueSuffixes(strings.Split(nodeMetadataDNSDomains, ","))
+		return nodeMetadataDNSDomainsUnique
+	}
+
+	// Otherwise just return the DNSDomain
+	return []string{parts}
 }
 
 const (
@@ -327,11 +362,20 @@ const (
 	// CertChainFilename is mTLS chain file
 	CertChainFilename = "cert-chain.pem"
 
+	// DefaultServerCertChain is the default path to the mTLS chain file
+	DefaultCertChain = AuthCertsPath + CertChainFilename
+
 	// KeyFilename is mTLS private key
 	KeyFilename = "key.pem"
 
+	// DefaultServerKey is the default path to the mTLS private key file
+	DefaultKey = AuthCertsPath + KeyFilename
+
 	// RootCertFilename is mTLS root cert
 	RootCertFilename = "root-cert.pem"
+
+	// DefaultRootCert is the default path to the mTLS root cert file
+	DefaultRootCert = AuthCertsPath + RootCertFilename
 
 	// IngressCertFilename is the ingress cert file name
 	IngressCertFilename = "tls.crt"
@@ -504,6 +548,11 @@ const (
 	// traffic interception mode at the proxy
 	NodeMetadataInterceptionMode = "INTERCEPTION_MODE"
 
+	// NodeMetadataHTTP10 indicates the application behind the sidecar is making outbound http requests with HTTP/1.0
+	// protocol. It will enable the "AcceptHttp_10" option on the http options for outbound HTTP listeners.
+	// Alpha in 1.1, based on feedback may be turned into an API or change. Set to "1" to enable.
+	NodeMetadataHTTP10 = "HTTP10"
+
 	// NodeMetadataConfigNamespace is the name of the metadata variable that carries info about
 	// the config namespace associated with the proxy
 	NodeMetadataConfigNamespace = "CONFIG_NAMESPACE"
@@ -522,9 +571,30 @@ const (
 	// NodeMetadataInstanceIPs is the set of IPs attached to this proxy
 	NodeMetadataInstanceIPs = "INSTANCE_IPS"
 
-	// NodeMetadataSdsTokenPath specifies the path of the SDS token used by the Enovy proxy.
+	// NodeMetadataSdsTokenPath specifies the path of the SDS token used by the Envoy proxy.
 	// If not set, Pilot uses the default SDS token path.
 	NodeMetadataSdsTokenPath = "SDS_TOKEN_PATH"
+
+	// NodeMetaDataDNSDomains is the list of DNS domains used for resolution
+	NodeMetadataDNSDomains = "DNS_DOMAINS"
+
+	// NodeMetadataTLSServerCertChain is the absolute path to server cert-chain file
+	NodeMetadataTLSServerCertChain = "TLS_SERVER_CERT_CHAIN"
+
+	// NodeMetadataTLSServerKey is the absolute path to server private key file
+	NodeMetadataTLSServerKey = "TLS_SERVER_KEY"
+
+	// NodeMetadataTLSServerRootCert is the absolute path to server root cert file
+	NodeMetadataTLSServerRootCert = "TLS_SERVER_ROOT_CERT"
+
+	// NodeMetadataTLSClientCertChain is the absolute path to client cert-chain file
+	NodeMetadataTLSClientCertChain = "TLS_CLIENT_CERT_CHAIN"
+
+	// NodeMetadataTLSClientKey is the absolute path to client private key file
+	NodeMetadataTLSClientKey = "TLS_CLIENT_KEY"
+
+	// NodeMetadataTLSClientRootCert is the absolute path to client root cert file
+	NodeMetadataTLSClientRootCert = "TLS_CLIENT_ROOT_CERT"
 )
 
 // TrafficInterceptionMode indicates how traffic to/from the workload is captured and
@@ -562,4 +632,30 @@ func (node *Proxy) GetInterceptionMode() TrafficInterceptionMode {
 	}
 
 	return InterceptionRedirect
+}
+
+// GetUniqueSuffixes Return a slice containing the strings with the longesest
+// unique suffixes
+func GetUniqueSuffixes(stringSlice []string) []string {
+	out := []string{}
+
+	// Iterate through the slice finding longest strings with unique suffixes
+	for _, stringOne := range stringSlice {
+		workString := ""
+		for _, stringTwo := range stringSlice {
+			// If strings have same suffix
+			if strings.HasSuffix(stringOne, stringTwo) {
+				// Keep the longest string from the first range
+				if len(stringOne) > len(stringTwo) {
+					workString = stringOne
+				}
+			}
+		}
+
+		// Append first range working string if a new one was found
+		if workString != "" {
+			out = append(out, workString)
+		}
+	}
+	return out
 }

@@ -107,6 +107,16 @@ func ValidatePort(port int) error {
 	return fmt.Errorf("port number %d must be in the range 1..65535", port)
 }
 
+// ValidatePort checks if all ports are in range [0, 65535]
+func ValidatePorts(ports []int32) bool {
+	for _, port := range ports {
+		if ValidatePort(int(port)) != nil {
+			return false
+		}
+	}
+	return true
+}
+
 // Validate checks that each name conforms to the spec and has a ProtoMessage
 func (descriptor ConfigDescriptor) Validate() error {
 	var errs error
@@ -1448,6 +1458,17 @@ func ValidateServiceRole(name, namespace string, msg proto.Message) error {
 		if len(rule.Services) == 0 {
 			errs = appendErrors(errs, fmt.Errorf("at least 1 service must be specified for rule %d", i))
 		}
+		// Regular rules and not rules (e.g. methods and not_methods should not be defined together).
+		sameAttributeKindError := "cannot have both regular and *not* attributes for the same kind (%s) for rule %d"
+		if len(rule.Methods) > 0 && len(rule.NotMethods) > 0 {
+			errs = appendErrors(errs, fmt.Errorf(sameAttributeKindError, "i.e. methods and not_methods", i))
+		}
+		if len(rule.Ports) > 0 && len(rule.NotPorts) > 0 {
+			errs = appendErrors(errs, fmt.Errorf(sameAttributeKindError, "i.e. ports and not_ports", i))
+		}
+		if !ValidatePorts(rule.Ports) || !ValidatePorts(rule.NotPorts) {
+			errs = appendErrors(errs, fmt.Errorf("at least one port is not in the range of [0, 65535]"))
+		}
 		for j, constraint := range rule.Constraints {
 			if len(constraint.Key) == 0 {
 				errs = appendErrors(errs, fmt.Errorf("key cannot be empty for constraint %d in rule %d", j, i))
@@ -1460,12 +1481,7 @@ func ValidateServiceRole(name, namespace string, msg proto.Message) error {
 	return errs
 }
 
-// ValidateServiceRoleBinding checks that ServiceRoleBinding is well-formed.
-func ValidateServiceRoleBinding(name, namespace string, msg proto.Message) error {
-	in, ok := msg.(*rbac.ServiceRoleBinding)
-	if !ok {
-		return errors.New("cannot cast to ServiceRoleBinding")
-	}
+func checkServiceRoleBinding(in *rbac.ServiceRoleBinding) error {
 	var errs error
 	if len(in.Subjects) == 0 {
 		errs = appendErrors(errs, fmt.Errorf("at least 1 subject must be specified"))
@@ -1488,6 +1504,29 @@ func ValidateServiceRoleBinding(name, namespace string, msg proto.Message) error
 		}
 	}
 	return errs
+}
+
+// ValidateServiceRoleBinding checks that ServiceRoleBinding is well-formed.
+func ValidateServiceRoleBinding(name, namespace string, msg proto.Message) error {
+	in, ok := msg.(*rbac.ServiceRoleBinding)
+	if !ok {
+		return errors.New("cannot cast to ServiceRoleBinding")
+	}
+	return checkServiceRoleBinding(in)
+}
+
+// ValidateAuthorizationPolicy checks that AuthorizationPolicy is well-formed.
+func ValidateAuthorizationPolicy(name, namespace string, msg proto.Message) error {
+	in, ok := msg.(*rbac.AuthorizationPolicy)
+	if !ok {
+		return errors.New("cannot cast to AuthorizationPolicy")
+	}
+	for _, binding := range in.Allow {
+		if err := checkServiceRoleBinding(binding); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func checkRbacConfig(name, typ string, msg proto.Message) error {
@@ -2146,12 +2185,12 @@ func ValidateServiceEntry(name, namespace string, config proto.Message) (errs er
 	switch serviceEntry.Resolution {
 	case networking.ServiceEntry_NONE:
 		if len(serviceEntry.Endpoints) != 0 {
-			errs = appendErrors(errs, fmt.Errorf("no endpoints should be provided for discovery type none"))
+			errs = appendErrors(errs, fmt.Errorf("no endpoints should be provided for resolution type none"))
 		}
 	case networking.ServiceEntry_STATIC:
 		if len(serviceEntry.Endpoints) == 0 {
 			errs = appendErrors(errs,
-				fmt.Errorf("endpoints must be provided if service entry discovery mode is static"))
+				fmt.Errorf("endpoints must be provided if service entry resolution mode is static"))
 		}
 
 		unixEndpoint := false
@@ -2183,7 +2222,7 @@ func ValidateServiceEntry(name, namespace string, config proto.Message) (errs er
 			for _, host := range serviceEntry.Hosts {
 				if err := ValidateFQDN(host); err != nil {
 					errs = appendErrors(errs,
-						fmt.Errorf("hosts must be FQDN if no endpoints are provided for discovery mode DNS"))
+						fmt.Errorf("hosts must be FQDN if no endpoints are provided for resolution mode DNS"))
 				}
 			}
 		}

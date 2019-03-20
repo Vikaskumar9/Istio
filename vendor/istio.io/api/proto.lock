@@ -1218,6 +1218,11 @@
                 "id": 2,
                 "name": "lightstep",
                 "type": "Lightstep"
+              },
+              {
+                "id": 3,
+                "name": "datadog",
+                "type": "Datadog"
               }
             ],
             "messages": [
@@ -1252,6 +1257,16 @@
                   {
                     "id": 4,
                     "name": "cacert_path",
+                    "type": "string"
+                  }
+                ]
+              },
+              {
+                "name": "Datadog",
+                "fields": [
+                  {
+                    "id": 1,
+                    "name": "address",
                     "type": "string"
                   }
                 ]
@@ -1985,6 +2000,21 @@
                 "id": 1,
                 "name": "policy",
                 "type": "FailPolicy"
+              },
+              {
+                "id": 2,
+                "name": "max_retry",
+                "type": "uint32"
+              },
+              {
+                "id": 3,
+                "name": "base_retry_wait",
+                "type": "google.protobuf.Duration"
+              },
+              {
+                "id": 4,
+                "name": "max_retry_wait",
+                "type": "google.protobuf.Duration"
               }
             ]
           },
@@ -3455,6 +3485,12 @@
                 "name": "export_to",
                 "type": "string",
                 "is_repeated": true
+              },
+              {
+                "id": 8,
+                "name": "subject_alt_names",
+                "type": "string",
+                "is_repeated": true
               }
             ],
             "messages": [
@@ -4636,6 +4672,11 @@
                 "id": 5,
                 "name": "custom_header",
                 "type": "string"
+              },
+              {
+                "id": 6,
+                "name": "server_name",
+                "type": "string"
               }
             ]
           },
@@ -4691,6 +4732,11 @@
               {
                 "id": 3,
                 "name": "ca_certificates",
+                "type": "string"
+              },
+              {
+                "id": 4,
+                "name": "server_name",
                 "type": "string"
               }
             ]
@@ -5341,13 +5387,13 @@
               },
               {
                 "id": 4,
-                "name": "principals",
+                "name": "names",
                 "type": "string",
                 "is_repeated": true
               },
               {
                 "id": 5,
-                "name": "not_principals",
+                "name": "not_names",
                 "type": "string",
                 "is_repeated": true
               },

@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// TODO(pitlv2109, yangminzhu): Need to refactor all unit tests. Tests are becoming hard to maintain.
+
 package authz
 
 import (
@@ -335,9 +337,10 @@ func TestConvertRbacRulesToFilterConfig(t *testing.T) {
 			Spec: &rbacproto.ServiceRole{
 				Rules: []*rbacproto.AccessRule{
 					{
-						Services: []string{"prefix.*", "*.suffix", "service"},
-						Methods:  []string{"GET", "POST"},
-						Paths:    []string{"*/suffix", "/prefix*", "/exact", "*"},
+						Services:   []string{"prefix.*", "*.suffix", "service"},
+						Methods:    []string{"GET", "POST"},
+						NotMethods: []string{"DELETE"},
+						Paths:      []string{"*/suffix", "/prefix*", "/exact", "*"},
 					},
 				},
 			},
@@ -366,8 +369,9 @@ func TestConvertRbacRulesToFilterConfig(t *testing.T) {
 			Spec: &rbacproto.ServiceRole{
 				Rules: []*rbacproto.AccessRule{
 					{
-						Services: []string{"allow-group"},
-						Methods:  []string{"GET"},
+						Services:   []string{"allow-group"},
+						Methods:    []string{"GET"},
+						NotMethods: []string{"*"},
 					},
 				},
 			},
@@ -401,6 +405,87 @@ func TestConvertRbacRulesToFilterConfig(t *testing.T) {
 			Spec: &rbacproto.ServiceRole{
 				Rules: []*rbacproto.AccessRule{
 					{Services: []string{"service_empty"}},
+				},
+			},
+		},
+		{
+			ConfigMeta: model.ConfigMeta{Name: "service-role-7"},
+			Spec: &rbacproto.ServiceRole{
+				Rules: []*rbacproto.AccessRule{
+					{
+						Services: []string{"mysql"},
+						Constraints: []*rbacproto.AccessRule_Constraint{
+							{Key: "experimental.envoy.filters.network.mysql_proxy[db.table]", Values: []string{"[update]"}},
+						},
+					},
+				},
+			},
+		},
+		{
+			ConfigMeta: model.ConfigMeta{Name: "service-role-8"},
+			Spec: &rbacproto.ServiceRole{
+				Rules: []*rbacproto.AccessRule{
+					{
+						Services: []string{"dummy"},
+						Constraints: []*rbacproto.AccessRule_Constraint{
+							{Key: "experimental.envoy.filters.dummy[key]", Values: []string{"value"}},
+						},
+					},
+				},
+			},
+		},
+		{
+			ConfigMeta: model.ConfigMeta{Name: "service-role-9"},
+			Spec: &rbacproto.ServiceRole{
+				Rules: []*rbacproto.AccessRule{
+					{
+						Services: []string{"service-9"},
+						Ports:    []int32{9080, 3000},
+					},
+				},
+			},
+		},
+		{
+			ConfigMeta: model.ConfigMeta{Name: "service-role-10"},
+			Spec: &rbacproto.ServiceRole{
+				Rules: []*rbacproto.AccessRule{
+					{
+						Services: []string{"service-10"},
+						Hosts:    []string{"*.google.com"},
+					},
+				},
+			},
+		},
+		{
+			ConfigMeta: model.ConfigMeta{Name: "service-role-11"},
+			Spec: &rbacproto.ServiceRole{
+				Rules: []*rbacproto.AccessRule{
+					{
+						Services: []string{"service-11"},
+						NotHosts: []string{"finances.google.com"},
+					},
+				},
+			},
+		},
+		{
+			ConfigMeta: model.ConfigMeta{Name: "service-role-12"},
+			Spec: &rbacproto.ServiceRole{
+				Rules: []*rbacproto.AccessRule{
+					{
+						Services:   []string{"backup_service"},
+						NotMethods: []string{"DELETE"},
+					},
+				},
+			},
+		},
+		{
+			ConfigMeta: model.ConfigMeta{Name: "service-role-13"},
+			Spec: &rbacproto.ServiceRole{
+				Rules: []*rbacproto.AccessRule{
+					{
+						Services: []string{"service-13"},
+						NotPaths: []string{"/secret_path"},
+					},
 				},
 			},
 		},
@@ -504,6 +589,40 @@ func TestConvertRbacRulesToFilterConfig(t *testing.T) {
 				},
 			},
 		},
+		{
+			ConfigMeta: model.ConfigMeta{Name: "service-role-binding-7"},
+			Spec: &rbacproto.ServiceRoleBinding{
+				Subjects: []*rbacproto.Subject{
+					{
+						User: "*",
+					},
+				},
+				RoleRef: &rbacproto.RoleRef{
+					Kind: "ServiceRole",
+					Name: "service-role-7",
+				},
+			},
+		},
+		{
+			ConfigMeta: model.ConfigMeta{Name: "service-role-binding-8"},
+			Spec: &rbacproto.ServiceRoleBinding{
+				Subjects: []*rbacproto.Subject{
+					{
+						User: "*",
+					},
+				},
+				RoleRef: &rbacproto.RoleRef{
+					Kind: "ServiceRole",
+					Name: "service-role-8",
+				},
+			},
+		},
+
+		generateSimpleServiceRoleBindingAllGroups("service-role-9", "service-role-binding-9"),
+		generateSimpleServiceRoleBindingAllGroups("service-role-10", "service-role-binding-10"),
+		generateSimpleServiceRoleBindingAllGroups("service-role-11", "service-role-binding-11"),
+		generateSimpleServiceRoleBindingAllGroups("service-role-12", "service-role-binding-12"),
+		generateSimpleServiceRoleBindingAllGroups("service-role-13", "service-role-binding-13"),
 	}
 
 	policy1 := &policy.Policy{
@@ -517,6 +636,15 @@ func TestConvertRbacRulesToFilterConfig(t *testing.T) {
 									{Name: ":method", HeaderMatchSpecifier: &route.HeaderMatcher_ExactMatch{ExactMatch: "GET"}},
 									{Name: ":method", HeaderMatchSpecifier: &route.HeaderMatcher_ExactMatch{ExactMatch: "POST"}},
 								}),
+							},
+							{
+								Rule: &policy.Permission_NotRule{
+									NotRule: &policy.Permission{
+										Rule: generateHeaderRule([]*route.HeaderMatcher{
+											{Name: ":method", HeaderMatchSpecifier: &route.HeaderMatcher_ExactMatch{ExactMatch: "DELETE"}},
+										}),
+									},
+								},
 							},
 							{
 								Rule: generateHeaderRule([]*route.HeaderMatcher{
@@ -609,13 +737,13 @@ func TestConvertRbacRulesToFilterConfig(t *testing.T) {
 					Ids: []*policy.Principal{
 						{
 							Identifier: &policy.Principal_Metadata{
-								Metadata: generateMetadataListMatcher(
+								Metadata: generateMetadataListMatcher(authn.AuthnFilterName,
 									[]string{attrRequestClaims, "groups"}, "group*"),
 							},
 						},
 						{
 							Identifier: &policy.Principal_Metadata{
-								Metadata: generateMetadataListMatcher(
+								Metadata: generateMetadataListMatcher(authn.AuthnFilterName,
 									[]string{attrRequestClaims, "iss"}, "test-iss"),
 							},
 						},
@@ -774,6 +902,135 @@ func TestConvertRbacRulesToFilterConfig(t *testing.T) {
 		},
 	}
 
+	policy7 := &policy.Policy{
+		Permissions: []*policy.Permission{{
+			Rule: &policy.Permission_AndRules{
+				AndRules: &policy.Permission_Set{
+					Rules: []*policy.Permission{{
+						Rule: &policy.Permission_OrRules{
+							OrRules: &policy.Permission_Set{
+								Rules: []*policy.Permission{{
+									Rule: &policy.Permission_Metadata{
+										Metadata: generateMetadataListMatcher("envoy.filters.network.mysql_proxy", []string{"db.table"}, "update"),
+									},
+								}},
+							},
+						},
+					}},
+				},
+			},
+		}},
+		Principals: []*policy.Principal{{
+			Identifier: &policy.Principal_AndIds{
+				AndIds: &policy.Principal_Set{
+					Ids: []*policy.Principal{{
+						Identifier: &policy.Principal_Any{
+							Any: true,
+						},
+					}},
+				},
+			},
+		}},
+	}
+
+	policy8sm := createStringMatcher("value", false, false)
+	policy8 := &policy.Policy{
+		Permissions: []*policy.Permission{{
+			Rule: &policy.Permission_AndRules{
+				AndRules: &policy.Permission_Set{
+					Rules: []*policy.Permission{{
+						Rule: &policy.Permission_OrRules{
+							OrRules: &policy.Permission_Set{
+								Rules: []*policy.Permission{{
+									Rule: &policy.Permission_Metadata{
+										Metadata: generateMetadataStringMatcher("key", policy8sm, "envoy.filters.dummy"),
+									},
+								}},
+							},
+						},
+					}},
+				},
+			},
+		}},
+		Principals: []*policy.Principal{{
+			Identifier: &policy.Principal_AndIds{
+				AndIds: &policy.Principal_Set{
+					Ids: []*policy.Principal{{
+						Identifier: &policy.Principal_Any{
+							Any: true,
+						},
+					}},
+				},
+			},
+		}},
+	}
+
+	policy9 := &policy.Policy{
+		Permissions: []*policy.Permission{
+			{
+				Rule: &policy.Permission_AndRules{
+					AndRules: &policy.Permission_Set{
+						Rules: []*policy.Permission{
+							{
+								Rule: generateDestinationPortRule([]uint32{9080, 3000}),
+							},
+						},
+					},
+				},
+			},
+		},
+		Principals: []*policy.Principal{{
+			Identifier: &policy.Principal_AndIds{
+				AndIds: &policy.Principal_Set{
+					Ids: []*policy.Principal{
+						{
+							Identifier: &policy.Principal_Metadata{
+								Metadata: generateMetadataListMatcher(authn.AuthnFilterName,
+									[]string{attrRequestClaims, "groups"}, "group*"),
+							},
+						},
+					},
+				},
+			},
+		}},
+	}
+
+	policy10 := &policy.Policy{
+		Permissions: []*policy.Permission{
+			{
+				Rule: &policy.Permission_AndRules{
+					AndRules: &policy.Permission_Set{
+						Rules: []*policy.Permission{
+							{
+								Rule: generateHeaderRule([]*route.HeaderMatcher{
+									{Name: hostHeader, HeaderMatchSpecifier: &route.HeaderMatcher_SuffixMatch{SuffixMatch: ".google.com"}},
+								}),
+							},
+						},
+					},
+				},
+			},
+		},
+		Principals: []*policy.Principal{{
+			Identifier: &policy.Principal_AndIds{
+				AndIds: &policy.Principal_Set{
+					Ids: []*policy.Principal{
+						{
+							Identifier: &policy.Principal_Metadata{
+								Metadata: generateMetadataListMatcher(authn.AuthnFilterName,
+									[]string{attrRequestClaims, "groups"}, "group*"),
+							},
+						},
+					},
+				},
+			},
+		}},
+	}
+
+	policy11 := generateSimplePolicyForNotRuleWithHeader(hostHeader, "finances.google.com")
+	policy12 := generateSimplePolicyForNotRuleWithHeader(methodHeader, "DELETE")
+	policy13 := generateSimplePolicyForNotRuleWithHeader(pathHeader, "/secret_path")
+
 	expectRbac1 := &policy.RBAC{
 		Action: policy.RBAC_ALLOW,
 		Policies: map[string]*policy.Policy{
@@ -781,36 +1038,30 @@ func TestConvertRbacRulesToFilterConfig(t *testing.T) {
 			"service-role-2": policy2,
 		},
 	}
-	expectRbac2 := &policy.RBAC{
+
+	expectRbac2 := generateExpectRBACForSinglePolicy("service-role-2", policy2)
+	expectRbac3 := generateExpectRBACForSinglePolicy("service-role-3", policy3)
+	expectRbac4 := generateExpectRBACForSinglePolicy("service-role-4", policy4)
+	expectRbac5 := generateExpectRBACForSinglePolicy("service-role-5", policy5)
+	expectRbac6 := generateExpectRBACForSinglePolicy("service-role-6", policy6)
+
+	expectRbac7 := &policy.RBAC{
 		Action: policy.RBAC_ALLOW,
 		Policies: map[string]*policy.Policy{
-			"service-role-2": policy2,
+			"service-role-7": policy7,
 		},
 	}
-	expectRbac3 := &policy.RBAC{
+	expectRbac8 := &policy.RBAC{
 		Action: policy.RBAC_ALLOW,
 		Policies: map[string]*policy.Policy{
-			"service-role-3": policy3,
+			"service-role-8": policy8,
 		},
 	}
-	expectRbac4 := &policy.RBAC{
-		Action: policy.RBAC_ALLOW,
-		Policies: map[string]*policy.Policy{
-			"service-role-4": policy4,
-		},
-	}
-	expectRbac5 := &policy.RBAC{
-		Action: policy.RBAC_ALLOW,
-		Policies: map[string]*policy.Policy{
-			"service-role-5": policy5,
-		},
-	}
-	expectRbac6 := &policy.RBAC{
-		Action: policy.RBAC_ALLOW,
-		Policies: map[string]*policy.Policy{
-			"service-role-6": policy6,
-		},
-	}
+	expectRbac9 := generateExpectRBACForSinglePolicy("service-role-9", policy9)
+	expectRbac10 := generateExpectRBACForSinglePolicy("service-role-10", policy10)
+	expectRbac11 := generateExpectRBACForSinglePolicy("service-role-11", policy11)
+	expectRbac12 := generateExpectRBACForSinglePolicy("service-role-12", policy12)
+	expectRbac13 := generateExpectRBACForSinglePolicy("service-role-13", policy13)
 
 	authzPolicies := newAuthzPoliciesWithRolesAndBindings(roles, bindings)
 	option := rbacOption{authzPolicies: authzPolicies}
@@ -890,6 +1141,62 @@ func TestConvertRbacRulesToFilterConfig(t *testing.T) {
 				name: "service_empty",
 			},
 			rbac:   expectRbac6,
+			option: option,
+		},
+		{
+			name: "service with metadata list constraints",
+			service: &serviceMetadata{
+				name: "mysql",
+			},
+			rbac:   expectRbac7,
+			option: rbacOption{authzPolicies: authzPolicies, forTCPFilter: true},
+		},
+		{
+			name: "service with metadata value constraints",
+			service: &serviceMetadata{
+				name: "dummy",
+			},
+			rbac:   expectRbac8,
+			option: rbacOption{authzPolicies: authzPolicies, forTCPFilter: true},
+		},
+		{
+			name: "ports rule",
+			service: &serviceMetadata{
+				name: "service-9",
+			},
+			rbac:   expectRbac9,
+			option: option,
+		},
+		{
+			name: "hosts rule",
+			service: &serviceMetadata{
+				name: "service-10",
+			},
+			rbac:   expectRbac10,
+			option: option,
+		},
+		{
+			name: "not_hosts rule",
+			service: &serviceMetadata{
+				name: "service-11",
+			},
+			rbac:   expectRbac11,
+			option: option,
+		},
+		{
+			name: "not_methods rule",
+			service: &serviceMetadata{
+				name: "backup_service",
+			},
+			rbac:   expectRbac12,
+			option: option,
+		},
+		{
+			name: "not_paths rule",
+			service: &serviceMetadata{
+				name: "service-13",
+			},
+			rbac:   expectRbac13,
 			option: option,
 		},
 	}
@@ -1328,11 +1635,11 @@ func TestCreateDynamicMetadataMatcher(t *testing.T) {
 		},
 		{
 			k: attrRequestClaims + "[groups]", v: "group*", tcp: false,
-			expect: generateMetadataListMatcher([]string{attrRequestClaims, "groups"}, "group*"),
+			expect: generateMetadataListMatcher(authn.AuthnFilterName, []string{attrRequestClaims, "groups"}, "group*"),
 		},
 		{
 			k: attrRequestClaims + "[iss]", v: "test-iss", tcp: false,
-			expect: generateMetadataListMatcher([]string{attrRequestClaims, "iss"}, "test-iss"),
+			expect: generateMetadataListMatcher(authn.AuthnFilterName, []string{attrRequestClaims, "iss"}, "test-iss"),
 		},
 		{
 			k: attrSrcUser, v: "*test-user", tcp: false,

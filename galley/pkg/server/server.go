@@ -22,6 +22,7 @@ import (
 	"sync"
 	"time"
 
+	"golang.org/x/time/rate"
 	"google.golang.org/grpc"
 
 	mcp "istio.io/api/mcp/v1alpha1"
@@ -40,6 +41,7 @@ import (
 	"istio.io/istio/pkg/log"
 	"istio.io/istio/pkg/mcp/creds"
 	"istio.io/istio/pkg/mcp/monitoring"
+	mcprate "istio.io/istio/pkg/mcp/rate"
 	"istio.io/istio/pkg/mcp/server"
 	"istio.io/istio/pkg/mcp/snapshot"
 	"istio.io/istio/pkg/mcp/source"
@@ -66,7 +68,8 @@ type Server struct {
 
 type patchTable struct {
 	newKubeFromConfigFile       func(string) (client.Interfaces, error)
-	verifyResourceTypesPresence func(client.Interfaces) error
+	verifyResourceTypesPresence func(client.Interfaces, []schema.ResourceSpec) error
+	findSupportedResources      func(client.Interfaces, []schema.ResourceSpec) ([]schema.ResourceSpec, error)
 	newSource                   func(client.Interfaces, time.Duration, *schema.Instance, *converter.Config) (runtime.Source, error)
 	netListen                   func(network, address string) (net.Listener, error)
 	newMeshConfigCache          func(path string) (meshconfig.Cache, error)
@@ -78,6 +81,7 @@ func defaultPatchTable() patchTable {
 	return patchTable{
 		newKubeFromConfigFile:       client.NewKubeFromConfigFile,
 		verifyResourceTypesPresence: check.ResourceTypesPresence,
+		findSupportedResources:      check.FindSupportedResourceSchemas,
 		newSource:                   kubeSource.New,
 		netListen:                   net.Listen,
 		mcpMetricReporter:           func(prefix string) monitoring.Reporter { return monitoring.NewStatsContext(prefix) },
@@ -125,9 +129,15 @@ func newServer(a *Args, p patchTable) (*Server, error) {
 			return nil, err
 		}
 		if !a.DisableResourceReadyCheck {
-			if err := p.verifyResourceTypesPresence(k); err != nil {
+			if err := p.verifyResourceTypesPresence(k, sourceSchema.All()); err != nil {
 				return nil, err
 			}
+		} else {
+			found, err := p.findSupportedResources(k, sourceSchema.All())
+			if err != nil {
+				return nil, err
+			}
+			sourceSchema = schema.New(found...)
 		}
 		src, err = p.newSource(k, a.ResyncPeriod, sourceSchema, converterCfg)
 		if err != nil {
@@ -147,7 +157,8 @@ func newServer(a *Args, p patchTable) (*Server, error) {
 	grpcOptions = append(grpcOptions, grpc.MaxRecvMsgSize(int(a.MaxReceivedMessageSize)))
 
 	s.stopCh = make(chan struct{})
-	var checker server.AuthChecker = server.NewAllowAllChecker()
+	var checker server.AuthChecker
+	checker = server.NewAllowAllChecker()
 	if !a.Insecure {
 		checker, err = watchAccessList(s.stopCh, a.AccessListFile)
 		if err != nil {
@@ -168,13 +179,14 @@ func newServer(a *Args, p patchTable) (*Server, error) {
 	s.reporter = p.mcpMetricReporter("galley/mcp/source")
 
 	options := &source.Options{
-		Watcher:           distributor,
-		Reporter:          s.reporter,
-		CollectionOptions: source.CollectionOptionsFromSlice(metadata.Types.Collections()),
+		Watcher:            distributor,
+		Reporter:           s.reporter,
+		CollectionsOptions: source.CollectionOptionsFromSlice(metadata.Types.Collections()),
+		ConnRateLimiter:    mcprate.NewRateLimiter(time.Second, 100), // TODO(Nino-K): https://github.com/istio/istio/issues/12074
 	}
 
 	if a.SinkAddress != "" {
-		s.callOut, err = newCallout(a.SinkAddress, a.SinkAuthMode, options)
+		s.callOut, err = newCallout(a.SinkAddress, a.SinkAuthMode, a.SinkMeta, options)
 		if err != nil {
 			s.callOut = nil
 			scope.Fatalf("Callout could not be initialized: %v", err)
@@ -183,7 +195,10 @@ func newServer(a *Args, p patchTable) (*Server, error) {
 
 	s.mcp = server.New(options, checker)
 
-	serverOptions := &source.ServerOptions{AuthChecker: checker}
+	serverOptions := &source.ServerOptions{
+		AuthChecker: checker,
+		RateLimiter: rate.NewLimiter(rate.Every(time.Second), 100), // TODO(Nino-K): https://github.com/istio/istio/issues/12074
+	}
 	s.mcpSource = source.NewServer(options, serverOptions)
 
 	// get the network stuff setup

@@ -19,6 +19,8 @@ import (
 	"reflect"
 	"testing"
 
+	"github.com/stretchr/testify/assert"
+
 	meshconfig "istio.io/api/mesh/v1alpha1"
 	"istio.io/istio/pilot/pkg/model"
 	"istio.io/istio/pilot/pkg/serviceregistry/memory"
@@ -38,7 +40,7 @@ func TestServiceNode(t *testing.T) {
 				Type:        model.Ingress,
 				ID:          "random",
 				IPAddresses: []string{"10.3.3.3"},
-				DNSDomain:   "local",
+				DNSDomains:  []string{"local"},
 			},
 			out: "ingress~10.3.3.3~random~local",
 		},
@@ -47,7 +49,7 @@ func TestServiceNode(t *testing.T) {
 				Type:        model.SidecarProxy,
 				ID:          "random",
 				IPAddresses: []string{"10.3.3.3", "10.4.4.4", "10.5.5.5", "10.6.6.6"},
-				DNSDomain:   "local",
+				DNSDomains:  []string{"local"},
 				Metadata: map[string]string{
 					"INSTANCE_IPS": "10.3.3.3,10.4.4.4,10.5.5.5,10.6.6.6",
 				},
@@ -68,6 +70,28 @@ func TestServiceNode(t *testing.T) {
 		}
 		if !reflect.DeepEqual(in, node.in) {
 			t.Errorf("ParseServiceNode(%q) => Got %#v, want %#v", node.out, in, node.in)
+		}
+	}
+}
+
+func TestGetUniqueSuffixes(t *testing.T) {
+	data := []struct {
+		in  []string
+		out []string
+	}{
+		{
+			in:  []string{"part1.part2.com", "part2.com", "default.svc.local", "kube.default.svc.local"},
+			out: []string{"part1.part2.com", "kube.default.svc.local"},
+		},
+		{
+			in:  []string{"global", "istio-system.global", "global"},
+			out: []string{"istio-system.global"},
+		},
+	}
+	for _, datum := range data {
+		out := model.GetUniqueSuffixes(datum.in)
+		if !reflect.DeepEqual(datum.out, out) {
+			t.Errorf("GetSuperString() =>\n Got %s\nwant %s", out, datum.out)
 		}
 	}
 }
@@ -176,4 +200,11 @@ networks:
 	if !reflect.DeepEqual(got, &want) {
 		t.Fatalf("Wrong values:\n got %#v \nwant %#v", got, &want)
 	}
+}
+
+func TestGetOrDefaultFromMap(t *testing.T) {
+	meta := map[string]string{"key1": "key1ValueFromMap"}
+	assert.Equal(t, "key1ValueFromMap", model.GetOrDefaultFromMap(meta, "key1", "unexpected"))
+	assert.Equal(t, "expectedDefaultKey2Value", model.GetOrDefaultFromMap(meta, "key2", "expectedDefaultKey2Value"))
+	assert.Equal(t, "expectedDefaultFromNilMap", model.GetOrDefaultFromMap(nil, "key", "expectedDefaultFromNilMap"))
 }

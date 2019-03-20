@@ -60,7 +60,6 @@ func TestSecretController(t *testing.T) {
 		existingSecret   *v1.Secret
 		saToAdd          *v1.ServiceAccount
 		saToDelete       *v1.ServiceAccount
-		sasToUpdate      *updatedSas
 		expectedActions  []ktesting.Action
 		gracePeriodRatio float32
 		injectFailure    bool
@@ -86,27 +85,6 @@ func TestSecretController(t *testing.T) {
 			saToDelete: createServiceAccount("deleted", "deleted-ns"),
 			expectedActions: []ktesting.Action{
 				ktesting.NewDeleteAction(gvr, "deleted-ns", "istio.deleted"),
-			},
-			gracePeriodRatio: defaultGracePeriodRatio,
-			shouldFail:       false,
-		},
-		"updating service accounts does nothing if name and namespace are not changed": {
-			sasToUpdate: &updatedSas{
-				curSa: createServiceAccount("name", "ns"),
-				oldSa: createServiceAccount("name", "ns"),
-			},
-			gracePeriodRatio: defaultGracePeriodRatio,
-			expectedActions:  []ktesting.Action{},
-			shouldFail:       false,
-		},
-		"updating service accounts deletes old secret and creates a new one": {
-			sasToUpdate: &updatedSas{
-				curSa: createServiceAccount("new-name", "new-ns"),
-				oldSa: createServiceAccount("old-name", "old-ns"),
-			},
-			expectedActions: []ktesting.Action{
-				ktesting.NewDeleteAction(gvr, "old-ns", "istio.old-name"),
-				ktesting.NewCreateAction(gvr, "new-ns", ca.BuildSecret("new-name", "istio.new-name", "new-ns", certChain, caKey, rootCert, nil, nil, IstioSecretType)),
 			},
 			gracePeriodRatio: defaultGracePeriodRatio,
 			shouldFail:       false,
@@ -155,15 +133,15 @@ func TestSecretController(t *testing.T) {
 			})
 		}
 
-		webhooks := map[string]DNSNameEntry{
-			sidecarInjectorSvcAccount: {
+		webhooks := map[string]*DNSNameEntry{
+			sidecarInjectorSvcAccount: &DNSNameEntry{
 				ServiceName: sidecarInjectorSvc,
 				Namespace:   "test-ns",
 			},
 		}
 		controller, err := NewSecretController(createFakeCA(), defaultTTL,
 			tc.gracePeriodRatio, defaultMinGracePeriod, false, client.CoreV1(), false,
-			metav1.NamespaceAll, webhooks)
+			metav1.NamespaceAll, webhooks, "")
 		if tc.shouldFail {
 			if err == nil {
 				t.Errorf("should have failed to create secret controller")
@@ -188,9 +166,6 @@ func TestSecretController(t *testing.T) {
 		if tc.saToDelete != nil {
 			controller.saDeleted(tc.saToDelete)
 		}
-		if tc.sasToUpdate != nil {
-			controller.saUpdated(tc.sasToUpdate.oldSa, tc.sasToUpdate.curSa)
-		}
 
 		if err := checkActions(client.Actions(), tc.expectedActions); err != nil {
 			t.Errorf("Case %q: %s", k, err.Error())
@@ -204,7 +179,7 @@ func TestSecretContent(t *testing.T) {
 	client := fake.NewSimpleClientset()
 	controller, err := NewSecretController(createFakeCA(), defaultTTL,
 		defaultGracePeriodRatio, defaultMinGracePeriod, false, client.CoreV1(), false,
-		metav1.NamespaceAll, map[string]DNSNameEntry{})
+		metav1.NamespaceAll, map[string]*DNSNameEntry{}, "")
 	if err != nil {
 		t.Errorf("Failed to create secret controller: %v", err)
 	}
@@ -226,7 +201,7 @@ func TestDeletedIstioSecret(t *testing.T) {
 	client := fake.NewSimpleClientset()
 	controller, err := NewSecretController(createFakeCA(), defaultTTL,
 		defaultGracePeriodRatio, defaultMinGracePeriod, false, client.CoreV1(), false,
-		metav1.NamespaceAll, nil)
+		metav1.NamespaceAll, nil, "")
 	if err != nil {
 		t.Errorf("failed to create secret controller: %v", err)
 	}
@@ -344,7 +319,8 @@ func TestUpdateSecret(t *testing.T) {
 	for k, tc := range testCases {
 		client := fake.NewSimpleClientset()
 		controller, err := NewSecretController(createFakeCA(), time.Hour,
-			tc.gracePeriodRatio, tc.minGracePeriod, false, client.CoreV1(), false, metav1.NamespaceAll, nil)
+			tc.gracePeriodRatio, tc.minGracePeriod, false, client.CoreV1(), false, metav1.NamespaceAll,
+			nil, "")
 		if err != nil {
 			t.Errorf("failed to create secret controller: %v", err)
 		}
@@ -412,9 +388,4 @@ func createServiceAccount(name, namespace string) *v1.ServiceAccount {
 			Namespace: namespace,
 		},
 	}
-}
-
-type updatedSas struct {
-	curSa *v1.ServiceAccount
-	oldSa *v1.ServiceAccount
 }

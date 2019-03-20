@@ -196,7 +196,7 @@ type Server struct {
 	mesh             *meshconfig.MeshConfig
 	meshNetworks     *meshconfig.MeshNetworks
 	configController model.ConfigStoreCache
-	mixerSAN         []string
+
 	kubeClient       kubernetes.Interface
 	startFuncs       []startFunc
 	multicluster     *clusterregistry.Multicluster
@@ -243,9 +243,6 @@ func NewServer(args PilotArgs) (*Server, error) {
 	if err := s.initMeshNetworks(&args); err != nil {
 		return nil, fmt.Errorf("mesh networks: %v", err)
 	}
-	if err := s.initMixerSan(&args); err != nil {
-		return nil, fmt.Errorf("mixer san: %v", err)
-	}
 	if err := s.initConfigController(&args); err != nil {
 		return nil, fmt.Errorf("config controller: %v", err)
 	}
@@ -287,7 +284,7 @@ func (s *Server) Start(stop <-chan struct{}) error {
 type startFunc func(stop <-chan struct{}) error
 
 // initMonitor initializes the configuration for the pilot monitoring server.
-func (s *Server) initMonitor(args *PilotArgs) error {
+func (s *Server) initMonitor(args *PilotArgs) error { //nolint: unparam
 	s.addStartFunc(func(stop <-chan struct{}) error {
 		monitor, addr, err := startMonitor(args.DiscoveryOptions.MonitoringAddr, s.mux)
 		if err != nil {
@@ -423,7 +420,7 @@ func (s *Server) initMesh(args *PilotArgs) error {
 
 // initMeshNetworks loads the mesh networks configuration from the file provided
 // in the args and add a watcher for changes in this file.
-func (s *Server) initMeshNetworks(args *PilotArgs) error {
+func (s *Server) initMeshNetworks(args *PilotArgs) error { //nolint: unparam
 	if args.NetworksConfigFile == "" {
 		log.Info("mesh networks configuration not provided")
 		return nil
@@ -463,17 +460,6 @@ func (s *Server) initMeshNetworks(args *PilotArgs) error {
 		}
 	})
 
-	return nil
-}
-
-// initMixerSan configures the mixerSAN configuration item. The mesh must already have been configured.
-func (s *Server) initMixerSan(args *PilotArgs) error {
-	if s.mesh == nil {
-		return fmt.Errorf("the mesh has not been configured before configuring mixer spiffe")
-	}
-	if s.mesh.DefaultConfig.ControlPlaneAuthPolicy == meshconfig.AuthenticationPolicy_MUTUAL_TLS {
-		s.mixerSAN = []string{envoy.GetMixerSAN(args.Namespace)}
-	}
 	return nil
 }
 
@@ -577,7 +563,7 @@ func (s *Server) initMCPConfigController(args *PilotArgs) error {
 				}
 			case istio_networking_v1alpha3.TLSSettings_ISTIO_MUTUAL:
 				credentialOption = &creds.Options{
-					CertificateFile:   path.Join(model.AuthCertsPath, model.RootCertFilename),
+					CertificateFile:   path.Join(model.AuthCertsPath, model.CertChainFilename),
 					KeyFile:           path.Join(model.AuthCertsPath, model.KeyFilename),
 					CACertificateFile: path.Join(model.AuthCertsPath, model.RootCertFilename),
 				}
@@ -886,7 +872,6 @@ func (s *Server) createK8sServiceControllers(serviceControllers *aggregate.Contr
 			Name:             serviceregistry.KubernetesRegistry,
 			ClusterID:        clusterID,
 			ServiceDiscovery: kubectl,
-			ServiceAccounts:  kubectl,
 			Controller:       kubectl,
 		})
 
@@ -939,7 +924,6 @@ func (s *Server) initServiceControllers(args *PilotArgs) error {
 		Name:             "ServiceEntries",
 		Controller:       serviceEntryStore,
 		ServiceDiscovery: serviceEntryStore,
-		ServiceAccounts:  serviceEntryStore,
 	}
 	serviceControllers.AddRegistry(serviceEntryRegistry)
 
@@ -968,7 +952,6 @@ func (s *Server) initMemoryRegistry(serviceControllers *aggregate.Controller) {
 		Name:             serviceregistry.ServiceRegistry("mockAdapter1"),
 		ClusterID:        "mockAdapter1",
 		ServiceDiscovery: discovery1,
-		ServiceAccounts:  discovery1,
 		Controller:       &mockController{},
 	}
 
@@ -976,7 +959,6 @@ func (s *Server) initMemoryRegistry(serviceControllers *aggregate.Controller) {
 		Name:             serviceregistry.ServiceRegistry("mockAdapter2"),
 		ClusterID:        "mockAdapter2",
 		ServiceDiscovery: discovery2,
-		ServiceAccounts:  discovery2,
 		Controller:       &mockController{},
 	}
 	serviceControllers.AddRegistry(registry1)
@@ -989,8 +971,6 @@ func (s *Server) initDiscoveryService(args *PilotArgs) error {
 		MeshNetworks:     s.meshNetworks,
 		IstioConfigStore: s.istioConfigStore,
 		ServiceDiscovery: s.ServiceController,
-		ServiceAccounts:  s.ServiceController,
-		MixerSAN:         s.mixerSAN,
 	}
 
 	// Set up discovery service
@@ -1127,7 +1107,6 @@ func (s *Server) initConsulRegistry(serviceControllers *aggregate.Controller, ar
 		aggregate.Registry{
 			Name:             serviceregistry.ConsulRegistry,
 			ServiceDiscovery: conctl,
-			ServiceAccounts:  conctl,
 			Controller:       conctl,
 		})
 

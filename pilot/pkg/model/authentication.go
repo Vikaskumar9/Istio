@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"net/url"
 	"strconv"
+	"sync"
 
 	"github.com/envoyproxy/go-control-plane/envoy/api/v2/auth"
 	"github.com/envoyproxy/go-control-plane/envoy/api/v2/core"
@@ -48,7 +49,7 @@ const (
 
 	// k8sSAJwtTokenHeaderKey is the request header key for k8s jwt token.
 	// Binary header name must has suffix "-bin", according to https://github.com/grpc/grpc/blob/master/doc/PROTOCOL-HTTP2.md.
-	k8sSAJwtTokenHeaderKey = "istio_sds_credentail_header-bin"
+	k8sSAJwtTokenHeaderKey = "istio_sds_credentials_header-bin"
 
 	// IngressGatewaySdsUdsPath is the UDS path for ingress gateway to get credentials via SDS.
 	IngressGatewaySdsUdsPath = "unix:/var/run/ingress_gateway/sds"
@@ -60,10 +61,15 @@ const (
 // JwtKeyResolver resolves JWT public key and JwksURI.
 var JwtKeyResolver = newJwksResolver(JwtPubKeyExpireDuration, JwtPubKeyEvictionDuration, JwtPubKeyRefreshInterval)
 
-// GetConsolidateAuthenticationPolicy returns the authentication policy for
-// service specified by hostname and port, if defined. It also tries to resolve JWKS URI if necessary.
-func GetConsolidateAuthenticationPolicy(store IstioConfigStore, service *Service, port *Port) *authn.Policy {
-	config := store.AuthenticationPolicyByDestination(service, port)
+// GetConsolidateAuthenticationPolicy returns the authentication policy for workload specified by
+// hostname (or label selector if specified) and port, if defined.
+// It also tries to resolve JWKS URI if necessary.
+func GetConsolidateAuthenticationPolicy(store IstioConfigStore, serviceInstance *ServiceInstance) *authn.Policy {
+	service := serviceInstance.Service
+	port := serviceInstance.Endpoint.ServicePort
+	labels := serviceInstance.Labels
+
+	config := store.AuthenticationPolicyForWorkload(service, labels, port)
 	if config != nil {
 		policy := config.Spec.(*authn.Policy)
 		if err := JwtKeyResolver.SetAuthenticationPolicyJwksURIs(policy); err == nil {
@@ -232,7 +238,9 @@ func constructgRPCCallCredentials(tokenFileName, headerKey string) []*core.GrpcS
 		},
 		HeaderKey: headerKey,
 	}
-	any, _ := types.MarshalAny(config)
+
+	any := findOrMarshalFileBasedMetadataConfig(tokenFileName, headerKey, config)
+
 	return []*core.GrpcService_GoogleGrpc_CallCredentials{
 		&core.GrpcService_GoogleGrpc_CallCredentials{
 			CredentialSpecifier: &core.GrpcService_GoogleGrpc_CallCredentials_FromPlugin{
@@ -244,4 +252,34 @@ func constructgRPCCallCredentials(tokenFileName, headerKey string) []*core.GrpcS
 			},
 		},
 	}
+}
+
+type fbMetadataAnyKey struct {
+	tokenFileName string
+	headerKey     string
+}
+
+var fileBasedMetadataConfigAnyMap sync.Map
+
+// findOrMarshalFileBasedMetadataConfig searches google.protobuf.Any in fileBasedMetadataConfigAnyMap
+// by tokenFileName and headerKey, and returns google.protobuf.Any proto if found. If not found,
+// it takes the fbMetadata and marshals it into google.protobuf.Any, and stores this new
+// google.protobuf.Any into fileBasedMetadataConfigAnyMap.
+// FileBasedMetadataConfig only supports non-deterministic marshaling. As each SDS config contains
+// marshaled FileBasedMetadataConfig, the SDS config would differ if marshaling FileBasedMetadataConfig
+// returns different result. Once SDS config differs, Envoy will create multiple SDS clients to fetch
+// same SDS resource. To solve this problem, we use findOrMarshalFileBasedMetadataConfig so that
+// FileBasedMetadataConfig is marshaled once, and is reused in all SDS configs.
+func findOrMarshalFileBasedMetadataConfig(tokenFileName, headerKey string, fbMetadata *v2alpha.FileBasedMetadataConfig) *types.Any {
+	key := fbMetadataAnyKey{
+		tokenFileName: tokenFileName,
+		headerKey:     headerKey,
+	}
+	if v, found := fileBasedMetadataConfigAnyMap.Load(key); found {
+		marshalAny := v.(types.Any)
+		return &marshalAny
+	}
+	any, _ := types.MarshalAny(fbMetadata)
+	fileBasedMetadataConfigAnyMap.Store(key, *any)
+	return any
 }

@@ -22,6 +22,7 @@ import (
 	"io/ioutil"
 	"net"
 	"os"
+	"path"
 	"strconv"
 	"strings"
 	"sync"
@@ -42,6 +43,7 @@ import (
 	"istio.io/istio/pilot/pkg/serviceregistry"
 	"istio.io/istio/pkg/cmd"
 	"istio.io/istio/pkg/collateral"
+	"istio.io/istio/pkg/features/pilot"
 	"istio.io/istio/pkg/log"
 	"istio.io/istio/pkg/version"
 )
@@ -52,6 +54,7 @@ var (
 	registry         serviceregistry.ServiceRegistry
 	statusPort       uint16
 	applicationPorts []string
+	DNSDomain        string
 
 	// proxy config flags (named identically)
 	configPath               string
@@ -75,6 +78,13 @@ var (
 	concurrency              int
 	templateFile             string
 	disableInternalTelemetry bool
+	tlsServerCertChain       string
+	tlsServerKey             string
+	tlsServerRootCert        string
+	tlsClientCertChain       string
+	tlsClientKey             string
+	tlsClientRootCert        string
+	tlsCertsToWatch          []string
 	loggingOptions           = log.DefaultOptions()
 
 	wg sync.WaitGroup
@@ -139,6 +149,40 @@ var (
 			role.TrustDomain = spiffe.GetTrustDomain()
 			log.Infof("Proxy role: %#v", role)
 
+			// Add cert paths as node metadata only if they differ from defaults
+			if tlsServerCertChain != model.DefaultCertChain {
+				role.Metadata[model.NodeMetadataTLSServerCertChain] = tlsServerCertChain
+			}
+			if tlsServerKey != model.DefaultKey {
+				role.Metadata[model.NodeMetadataTLSServerKey] = tlsServerKey
+			}
+			if tlsServerRootCert != model.DefaultRootCert {
+				role.Metadata[model.NodeMetadataTLSServerRootCert] = tlsServerRootCert
+			}
+
+			if tlsClientCertChain != model.DefaultCertChain {
+				role.Metadata[model.NodeMetadataTLSClientCertChain] = tlsClientCertChain
+			}
+			if tlsClientKey != model.DefaultKey {
+				role.Metadata[model.NodeMetadataTLSClientKey] = tlsClientKey
+			}
+			if tlsClientRootCert != model.DefaultRootCert {
+				role.Metadata[model.NodeMetadataTLSClientRootCert] = tlsClientRootCert
+			}
+
+			tlsCertsToWatch = []string{
+				tlsServerCertChain, tlsServerKey, tlsServerRootCert,
+				tlsClientCertChain, tlsClientKey, tlsClientCertChain,
+			}
+
+			if role.Type == model.Ingress {
+				tlsCertsToWatch = append(tlsCertsToWatch, path.Join(model.IngressCertsPath, model.IngressCertFilename))
+				tlsCertsToWatch = append(tlsCertsToWatch, path.Join(model.IngressCertsPath, model.IngressKeyFilename))
+			}
+
+			// dedupe cert paths so we don't set up 2 watchers for the same file:
+			tlsCertsToWatch = dedupeStrings(tlsCertsToWatch)
+
 			proxyConfig := model.DefaultProxyConfig()
 
 			// set all flags
@@ -183,9 +227,17 @@ var (
 					}
 				}
 			}
-			role.DNSDomain = getDNSDomain(role.DNSDomain)
-			pilotSAN = getPilotSAN(role.DNSDomain, ns)
 
+			// Parse the DNSDomain based upon service registry type into a registry specific domain.
+			DNSDomain = getDNSDomain(DNSDomain)
+			setSpiffeTrustDomain(DNSDomain)
+			// role.ServiceNode() returns a string based upon this META which isn't set in the proxy-init.
+			role.DNSDomains = make([]string, 1)
+			role.DNSDomains[0] = DNSDomain
+			setSpiffeTrustDomain(DNSDomain)
+			// Obtain the SAN to later create a Envoy proxy.
+			pilotSAN = getSAN(ns, envoy.PilotSvcAccName, role.PilotIdentity)
+			log.Infof("PilotSAN %#v", pilotSAN)
 			// resolve statsd address
 			if proxyConfig.StatsdUdpAddress != "" {
 				addr, err := proxy.ResolveAddr(proxyConfig.StatsdUdpAddress)
@@ -231,21 +283,13 @@ var (
 				log.Infof("Effective config: %s", out)
 			}
 
-			certs := []envoy.CertSource{
-				{
-					Directory: model.AuthCertsPath,
-					Files:     []string{model.CertChainFilename, model.KeyFilename, model.RootCertFilename},
-				},
+			log.Infof("Monitored certs: %#v", tlsCertsToWatch)
+			// since Envoy needs the certs for mTLS, we wait for them to become available before starting it
+			if controlPlaneAuthPolicy == meshconfig.AuthenticationPolicy_MUTUAL_TLS.String() {
+				for _, cert := range tlsCertsToWatch {
+					waitForCerts(cert, 2*time.Minute)
+				}
 			}
-
-			if role.Type == model.Ingress {
-				certs = append(certs, envoy.CertSource{
-					Directory: model.IngressCertsPath,
-					Files:     []string{model.IngressCertFilename, model.IngressKeyFilename},
-				})
-			}
-
-			log.Infof("Monitored certs: %#v", certs)
 
 			// TODO: change Mixer and Pilot to use standard template and deprecate this custom bootstrap parser
 			if controlPlaneBootstrap {
@@ -253,7 +297,12 @@ var (
 					opts := make(map[string]string)
 					opts["PodName"] = os.Getenv("POD_NAME")
 					opts["PodNamespace"] = os.Getenv("POD_NAMESPACE")
-					opts["MixerSubjectAltName"] = envoy.GetMixerSAN(opts["PodNamespace"])
+
+					mixerSAN := getSAN(ns, envoy.MixerSvcAccName, role.MixerIdentity)
+					log.Infof("MixerSAN %#v", mixerSAN)
+					if len(mixerSAN) > 1 {
+						opts["MixerSubjectAltName"] = mixerSAN[0]
+					}
 
 					// protobuf encoding of IP_ADDRESS type
 					opts["PodIP"] = base64.StdEncoding.EncodeToString(net.ParseIP(os.Getenv("INSTANCE_IP")))
@@ -314,8 +363,8 @@ var (
 			log.Infof("PilotSAN %#v", pilotSAN)
 
 			envoyProxy := envoy.NewProxy(proxyConfig, role.ServiceNode(), proxyLogLevel, pilotSAN, role.IPAddresses)
-			agent := proxy.NewAgent(envoyProxy, proxy.DefaultRetry, proxyConfig.ParentShutdownDuration)
-			watcher := envoy.NewWatcher(certs, agent.ConfigCh())
+			agent := proxy.NewAgent(envoyProxy, proxy.DefaultRetry, pilot.TerminationDrainDuration())
+			watcher := envoy.NewWatcher(tlsCertsToWatch, agent.ConfigCh())
 
 			go waitForCompletion(ctx, agent.Run)
 			go waitForCompletion(ctx, watcher.Run)
@@ -326,14 +375,28 @@ var (
 	}
 )
 
+func dedupeStrings(in []string) []string {
+	stringMap := map[string]bool{}
+	for _, c := range in {
+		stringMap[c] = true
+	}
+	unique := make([]string, 0)
+	for c := range stringMap {
+		unique = append(unique, c)
+	}
+	return unique
+}
+
 func waitForCompletion(ctx context.Context, fn func(context.Context)) {
 	wg.Add(1)
 	fn(ctx)
 	wg.Done()
 }
 
-func getPilotSAN(domain string, ns string) []string {
-	var pilotSAN []string
+//explicitly setting the trustdomain so the pilot and mixer SAN will have same trustdomain
+//and the initialization of the spiffe pkg isn't linked to generating pilot's SAN first
+func setSpiffeTrustDomain(domain string) {
+
 	if controlPlaneAuthPolicy == meshconfig.AuthenticationPolicy_MUTUAL_TLS.String() {
 		pilotTrustDomain := role.TrustDomain
 		if len(pilotTrustDomain) == 0 {
@@ -348,10 +411,21 @@ func getPilotSAN(domain string, ns string) []string {
 			}
 		}
 		spiffe.SetTrustDomain(pilotTrustDomain)
-		pilotSAN = append(pilotSAN, envoy.GetPilotSAN(ns))
 	}
-	log.Infof("PilotSAN %#v", pilotSAN)
-	return pilotSAN
+
+}
+
+func getSAN(ns string, defaultSA string, overrideIdentity string) []string {
+	var san []string
+	if controlPlaneAuthPolicy == meshconfig.AuthenticationPolicy_MUTUAL_TLS.String() {
+
+		if overrideIdentity == "" {
+			san = append(san, envoy.GetSAN(ns, defaultSA))
+		} else {
+			san = append(san, envoy.GetSAN("", overrideIdentity))
+		}
+	}
+	return san
 }
 
 func getDNSDomain(domain string) string {
@@ -399,10 +473,15 @@ func init() {
 		"Proxy IP address. If not provided uses ${INSTANCE_IP} environment variable.")
 	proxyCmd.PersistentFlags().StringVar(&role.ID, "id", "",
 		"Proxy unique ID. If not provided uses ${POD_NAME}.${POD_NAMESPACE} from environment variables")
-	proxyCmd.PersistentFlags().StringVar(&role.DNSDomain, "domain", "",
+	proxyCmd.PersistentFlags().StringVar(&DNSDomain, "domain", "",
 		"DNS domain suffix. If not provided uses ${POD_NAMESPACE}.svc.cluster.local")
 	proxyCmd.PersistentFlags().StringVar(&role.TrustDomain, "trust-domain", "",
 		"The domain to use for identities")
+	proxyCmd.PersistentFlags().StringVar(&role.PilotIdentity, "pilotIdentity", "",
+		"The identity used as the suffix for pilot's spiffe SAN ")
+	proxyCmd.PersistentFlags().StringVar(&role.MixerIdentity, "mixerIdentity", "",
+		"The identity used as the suffix for mixer's spiffe SAN. This would only be used by pilot all other proxy would get this value from pilot")
+
 	proxyCmd.PersistentFlags().Uint16Var(&statusPort, "statusPort", 0,
 		"HTTP Port on which to serve pilot agent status. If zero, agent status will not be provided.")
 	proxyCmd.PersistentFlags().StringSliceVar(&applicationPorts, "applicationPorts", []string{},
@@ -458,6 +537,22 @@ func init() {
 	proxyCmd.PersistentFlags().BoolVar(&controlPlaneBootstrap, "controlPlaneBootstrap", true,
 		"Process bootstrap provided via templateFile to be used by control plane components.")
 
+	// server certs
+	proxyCmd.PersistentFlags().StringVar(&tlsServerCertChain, "tlsServerCertChain",
+		model.DefaultCertChain, "Absolute path to server cert-chain file used for istio mTLS")
+	proxyCmd.PersistentFlags().StringVar(&tlsServerKey, "tlsServerKey",
+		model.DefaultKey, "Absolute path to server private key file used for istio mTLS")
+	proxyCmd.PersistentFlags().StringVar(&tlsServerRootCert, "tlsServerRootCert",
+		model.DefaultRootCert, "Absolute path to server root cert file used for istio mTLS")
+
+	// client certs
+	proxyCmd.PersistentFlags().StringVar(&tlsClientCertChain, "tlsClientCertChain",
+		model.DefaultCertChain, "Absolute path to client cert-chain file used for istio mTLS")
+	proxyCmd.PersistentFlags().StringVar(&tlsClientKey, "tlsSClientKey",
+		model.DefaultKey, "Absolute path to client key file used for istio mTLS")
+	proxyCmd.PersistentFlags().StringVar(&tlsClientRootCert, "tlsClientRootCert",
+		model.DefaultRootCert, "Absolute path to client root cert file used for istio mTLS")
+
 	// Attach the Istio logging options to the command.
 	loggingOptions.AttachCobraFlags(rootCmd)
 
@@ -471,6 +566,37 @@ func init() {
 		Section: "pilot-agent CLI",
 		Manual:  "Istio Pilot Agent",
 	}))
+}
+
+func waitForCerts(fname string, maxWait time.Duration) {
+	log.Infof("waiting %v for %s", maxWait, fname)
+
+	logDelay := 1 * time.Second
+	nextLog := time.Now().Add(logDelay)
+	endWait := time.Now().Add(maxWait)
+
+	for {
+		_, err := os.Stat(fname)
+		if err == nil {
+			return
+		}
+		if !os.IsNotExist(err) { // another error (e.g., permission) - likely no point in waiting longer
+			log.Errora("error while waiting for certificates", err.Error())
+			return
+		}
+
+		now := time.Now()
+		if now.After(endWait) {
+			log.Warna("certificates still not available after", maxWait)
+			break
+		}
+		if now.After(nextLog) {
+			log.Infof("waiting for certificates")
+			logDelay = logDelay * 2
+			nextLog.Add(logDelay)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
 }
 
 func main() {

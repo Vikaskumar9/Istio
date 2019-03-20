@@ -80,10 +80,11 @@ const (
 	attrDestUser      = "destination.user"      // service account, e.g. "bookinfo-productpage".
 	attrConnSNI       = "connection.sni"        // server name indication, e.g. "www.example.com".
 
+	// Envoy config attributes for ServiceRole rules.
 	methodHeader = ":method"
 	pathHeader   = ":path"
-
-	spiffePrefix = spiffe.Scheme + "://"
+	hostHeader   = ":authority"
+	portKey      = "port"
 )
 
 // serviceMetadata is a collection of different kind of information about a service.
@@ -194,12 +195,12 @@ func generateMetadataStringMatcher(key string, v *metadata.StringMatcher, filter
 }
 
 // generateMetadataListMatcher generates a metadata list matcher for the given path keys and value.
-func generateMetadataListMatcher(keys []string, v string) *metadata.MetadataMatcher {
+func generateMetadataListMatcher(filter string, keys []string, v string) *metadata.MetadataMatcher {
 	listMatcher := &metadata.ListMatcher{
 		MatchPattern: &metadata.ListMatcher_OneOf{
 			OneOf: &metadata.ValueMatcher{
 				MatchPattern: &metadata.ValueMatcher_StringMatch{
-					StringMatch: createStringMatcher(v, false /* forceRegexPattern */, false /* forTCPFilter */),
+					StringMatch: createStringMatcher(v, false /* forceRegexPattern */, false /* prependSpiffe */),
 				},
 			},
 		},
@@ -213,7 +214,7 @@ func generateMetadataListMatcher(keys []string, v string) *metadata.MetadataMatc
 	}
 
 	return &metadata.MetadataMatcher{
-		Filter: authn.AuthnFilterName,
+		Filter: filter,
 		Path:   paths,
 		Value: &metadata.ValueMatcher{
 			MatchPattern: &metadata.ValueMatcher_ListMatch{
@@ -223,10 +224,10 @@ func generateMetadataListMatcher(keys []string, v string) *metadata.MetadataMatc
 	}
 }
 
-func createStringMatcher(v string, forceRegexPattern, forTCPFilter bool) *metadata.StringMatcher {
+func createStringMatcher(v string, forceRegexPattern, prependSpiffe bool) *metadata.StringMatcher {
 	extraPrefix := ""
-	if forTCPFilter {
-		extraPrefix = spiffePrefix
+	if prependSpiffe {
+		extraPrefix = spiffe.URIPrefix
 	}
 	var stringMatcher *metadata.StringMatcher
 	// Check if v is "*" first to make sure we won't generate an empty prefix/suffix StringMatcher,
@@ -266,7 +267,7 @@ func createDynamicMetadataMatcher(k, v string, forTCPFilter bool) *metadata.Meta
 		// Proxy doesn't have attrSrcNamespace directly, but the information is encoded in attrSrcPrincipal
 		// with format: cluster.local/ns/{NAMESPACE}/sa/{SERVICE-ACCOUNT}.
 		v = fmt.Sprintf(`*/ns/%s/*`, v)
-		stringMatcher := createStringMatcher(v, true /* forceRegexPattern */, false /* forTCPFilter */)
+		stringMatcher := createStringMatcher(v, true /* forceRegexPattern */, false /* prependSpiffe */)
 		return generateMetadataStringMatcher(attrSrcPrincipal, stringMatcher, filterName)
 	} else if strings.HasPrefix(k, attrRequestClaims) {
 		claim, err := extractNameInBrackets(strings.TrimPrefix(k, attrRequestClaims))
@@ -275,10 +276,10 @@ func createDynamicMetadataMatcher(k, v string, forTCPFilter bool) *metadata.Meta
 		}
 		// Generate a metadata list matcher for the given path keys and value.
 		// On proxy side, the value should be of list type.
-		return generateMetadataListMatcher([]string{attrRequestClaims, claim}, v)
+		return generateMetadataListMatcher(authn.AuthnFilterName, []string{attrRequestClaims, claim}, v)
 	}
 
-	stringMatcher := createStringMatcher(v, false /* forceRegexPattern */, false /* forTCPFilter */)
+	stringMatcher := createStringMatcher(v, false /* forceRegexPattern */, false /* prependSpiffe */)
 	if !attributesFromAuthN(k) {
 		rbacLog.Debugf("generated dynamic metadata matcher for custom property: %s", k)
 		if forTCPFilter {
@@ -301,7 +302,11 @@ func NewPlugin() plugin.Plugin {
 // OnOutboundListener is called whenever a new outbound listener is added to the LDS output for a given service
 // Can be used to add additional filters on the outbound path
 func (Plugin) OnOutboundListener(in *plugin.InputParams, mutable *plugin.MutableObjects) error {
-	return nil
+	if in.Node.Type != model.Router {
+		return nil
+	}
+
+	return buildFilter(in, mutable)
 }
 
 // OnInboundFilterChains is called whenever a plugin needs to setup the filter chains, including relevant filter chain configuration.
@@ -315,6 +320,15 @@ func (Plugin) OnInboundFilterChains(in *plugin.InputParams) []plugin.FilterChain
 func (Plugin) OnInboundListener(in *plugin.InputParams, mutable *plugin.MutableObjects) error {
 	// Only supports sidecar proxy for now.
 	if in.Node.Type != model.SidecarProxy {
+		return nil
+	}
+
+	return buildFilter(in, mutable)
+}
+
+func buildFilter(in *plugin.InputParams, mutable *plugin.MutableObjects) error {
+	if in.ServiceInstance == nil || in.ServiceInstance.Service == nil {
+		rbacLog.Errorf("nil service instance")
 		return nil
 	}
 
@@ -557,6 +571,26 @@ func convertRbacRulesToFilterConfig(service *serviceMetadata, option rbacOption)
 	return &http_config.RBAC{Rules: rbac}
 }
 
+// appendRule appends a |rule| to |rules| if |rule| is not nil.
+func appendRule(rules *policyproto.Permission_AndRules, rule *policyproto.Permission) {
+	if rule == nil {
+		return
+	}
+	rules.AndRules.Rules = append(rules.AndRules.Rules, rule)
+}
+
+// appendNotRule appends a |notRule| to AndRules of |rules| if |notRule| is not nil.
+func appendNotRule(rules *policyproto.Permission_AndRules, notRule *policyproto.Permission) {
+	if notRule == nil {
+		return
+	}
+	rules.AndRules.Rules = append(rules.AndRules.Rules,
+		&policyproto.Permission{Rule: &policyproto.Permission_NotRule{
+			NotRule: notRule,
+		},
+		})
+}
+
 // convertToPermission converts a single AccessRule to a Permission.
 func convertToPermission(rule *rbacproto.AccessRule) *policyproto.Permission {
 	rules := &policyproto.Permission_AndRules{
@@ -565,18 +599,44 @@ func convertToPermission(rule *rbacproto.AccessRule) *policyproto.Permission {
 		},
 	}
 
+	if len(rule.Hosts) > 0 {
+		hostRule := permissionForKeyValues(hostHeader, rule.Hosts)
+		appendRule(rules, hostRule)
+	}
+
+	if len(rule.NotHosts) > 0 {
+		notHostRule := permissionForKeyValues(hostHeader, rule.NotHosts)
+		appendNotRule(rules, notHostRule)
+	}
+
 	if len(rule.Methods) > 0 {
 		methodRule := permissionForKeyValues(methodHeader, rule.Methods)
-		if methodRule != nil {
-			rules.AndRules.Rules = append(rules.AndRules.Rules, methodRule)
-		}
+		appendRule(rules, methodRule)
+	}
+
+	if len(rule.NotMethods) > 0 {
+		notMethodRule := permissionForKeyValues(methodHeader, rule.NotMethods)
+		appendNotRule(rules, notMethodRule)
 	}
 
 	if len(rule.Paths) > 0 {
 		pathRule := permissionForKeyValues(pathHeader, rule.Paths)
-		if pathRule != nil {
-			rules.AndRules.Rules = append(rules.AndRules.Rules, pathRule)
-		}
+		appendRule(rules, pathRule)
+	}
+
+	if len(rule.NotPaths) > 0 {
+		notPathRule := permissionForKeyValues(pathHeader, rule.NotPaths)
+		appendNotRule(rules, notPathRule)
+	}
+
+	if len(rule.Ports) > 0 {
+		portRule := permissionForKeyValues(portKey, convertPortsToString(rule.Ports))
+		appendRule(rules, portRule)
+	}
+
+	if len(rule.NotPorts) > 0 {
+		notPortRule := permissionForKeyValues(portKey, convertPortsToString(rule.NotPorts))
+		appendNotRule(rules, notPortRule)
 	}
 
 	if len(rule.Constraints) > 0 {
@@ -584,16 +644,13 @@ func convertToPermission(rule *rbacproto.AccessRule) *policyproto.Permission {
 		// key and this should already be caught in validation stage.
 		for _, constraint := range rule.Constraints {
 			p := permissionForKeyValues(constraint.Key, constraint.Values)
-			if p != nil {
-				rules.AndRules.Rules = append(rules.AndRules.Rules, p)
-			}
+			appendRule(rules, p)
 		}
 	}
 
 	if len(rules.AndRules.Rules) == 0 {
 		// None of above rule satisfied means the permission applies to all paths/methods/constraints.
-		rules.AndRules.Rules = append(rules.AndRules.Rules,
-			&policyproto.Permission{Rule: &policyproto.Permission_Any{Any: true}})
+		appendRule(rules, &policyproto.Permission{Rule: &policyproto.Permission_Any{Any: true}})
 	}
 
 	return &policyproto.Permission{Rule: rules}
@@ -716,17 +773,17 @@ func permissionForKeyValues(key string, values []string) *policyproto.Permission
 				Rule: &policyproto.Permission_DestinationIp{DestinationIp: cidr},
 			}, nil
 		}
-	case key == attrDestPort:
+	case key == attrDestPort || key == portKey:
 		converter = func(v string) (*policyproto.Permission, error) {
-			port, err := convertToPort(v)
+			portValue, err := convertToPort(v)
 			if err != nil {
 				return nil, err
 			}
 			return &policyproto.Permission{
-				Rule: &policyproto.Permission_DestinationPort{DestinationPort: port},
+				Rule: &policyproto.Permission_DestinationPort{DestinationPort: portValue},
 			}, nil
 		}
-	case key == pathHeader || key == methodHeader:
+	case key == pathHeader || key == methodHeader || key == hostHeader:
 		converter = func(v string) (*policyproto.Permission, error) {
 			return &policyproto.Permission{
 				Rule: &policyproto.Permission_Header{
@@ -751,7 +808,27 @@ func permissionForKeyValues(key string, values []string) *policyproto.Permission
 		converter = func(v string) (*policyproto.Permission, error) {
 			return &policyproto.Permission{
 				Rule: &policyproto.Permission_RequestedServerName{
-					RequestedServerName: createStringMatcher(v, false /* forceRegexPattern */, false /* forTCPFilter */),
+					RequestedServerName: createStringMatcher(v, false /* forceRegexPattern */, false /* prependSpiffe */),
+				},
+			}, nil
+		}
+	case strings.HasPrefix(key, "experimental.envoy.filters.") && isKeyBinary(key):
+		// Split key of format experimental.envoy.filters.a.b[c] to [envoy.filters.a.b, c].
+		parts := strings.SplitN(strings.TrimSuffix(strings.TrimPrefix(key, "experimental."), "]"), "[", 2)
+		converter = func(v string) (*policyproto.Permission, error) {
+			// If value is of format [v], create a list matcher.
+			// Else, if value is of format v, create a string matcher.
+			var metadataMatcher *metadata.MetadataMatcher
+			if strings.HasPrefix(v, "[") && strings.HasSuffix(v, "]") {
+				metadataMatcher = generateMetadataListMatcher(parts[0], parts[1:], strings.Trim(v, "[]"))
+			} else {
+				stringMatcher := createStringMatcher(v, false /* forceRegexPattern */, false /* prependSpiffe */)
+				metadataMatcher = generateMetadataStringMatcher(parts[1], stringMatcher, parts[0])
+			}
+
+			return &policyproto.Permission{
+				Rule: &policyproto.Permission_Metadata{
+					Metadata: metadataMatcher,
 				},
 			}, nil
 		}
